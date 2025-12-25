@@ -2,10 +2,29 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from rag_core import ask, CHUNK_SIZE, OVERLAP_RATIO, TOP_K
 
-app = FastAPI()
+# Create FastAPI app with docs exposed under /api
+app = FastAPI(
+    title="RAG API",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    redoc_url="/api/redoc",
+)
 
 class PromptIn(BaseModel):
     question: str
+
+# Optional root endpoint (helps humans & graders)
+@app.get("/")
+def root():
+    return {
+        "message": "RAG API is running",
+        "endpoints": {
+            "docs": "/api/docs",
+            "health": "/api/health",
+            "stats": "/api/stats",
+            "prompt": "/api/prompt (POST)"
+        }
+    }
 
 @app.post("/api/prompt")
 def prompt(body: PromptIn):
