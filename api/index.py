@@ -18,3 +18,7 @@ def stats():
         "overlap_ratio": OVERLAP_RATIO,
         "top_k": TOP_K
     }
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
