@@ -19,13 +19,19 @@ CHUNK_SIZE_TOKENS = 1100
 OVERLAP_RATIO = 0.2
 TOP_K = 15  # not used during indexing; for later retrieval endpoint
 
-SUBSET_CSV = Path("data/ted_talks_en_subset_50.csv")
-MANIFEST_PATH = Path("data/embedded_manifest.jsonl")
+# ✅ FULL DATASET CSV (produced by your updated chunks.py)
+FULL_CSV = Path("data/ted_talks_en_full.csv")
+
+# ✅ NEW manifest for full ingest (recommended to avoid mixing with subset runs)
+MANIFEST_PATH = Path("data/embedded_manifest_full.jsonl")
 
 EMBED_MODEL = "RPRTHPB-text-embedding-3-small"
 EMB_DIM = 1536
 
 UPSERT_BATCH = 100
+
+# ✅ If True, clears the Pinecone index before re-ingesting (use when re-embedding everything)
+CLEAR_INDEX_BEFORE_INGEST = True
 
 
 # ----------------------------
@@ -39,13 +45,18 @@ def require_env(name: str) -> str:
 
 
 def clean_base_url(url: Optional[str]) -> Optional[str]:
-    """Remove accidental quotes/spaces and validate protocol."""
-    if not url:
+    """Remove accidental quotes/spaces. Return None if empty."""
+    if url is None:
         return None
-    url = url.strip().strip('"').strip("'").strip()
-    if not url.startswith(("http://", "https://")):
-        raise ValueError(f"OPENAI_BASE_URL must start with http:// or https://, got: {url}")
-    return url
+    s = str(url).strip()
+    if not s:
+        return None
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    # Optional strict validation
+    if s and not s.startswith(("http://", "https://")):
+        raise ValueError(f"OPENAI_BASE_URL must start with http:// or https://, got: {s}")
+    return s or None
 
 
 def sha1_text(s: str) -> str:
@@ -59,11 +70,13 @@ def load_manifest(path: Path) -> Set[str]:
     seen: Set[str] = set()
     with path.open("r", encoding="utf-8") as f:
         for line in f:
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
             obj = json.loads(line)
-            if "text_hash" in obj:
-                seen.add(obj["text_hash"])
+            th = obj.get("text_hash")
+            if th:
+                seen.add(th)
     return seen
 
 
@@ -93,7 +106,8 @@ def chunk_text_tokens(text: str, chunk_size: int, overlap_ratio: float, tokenize
 
 
 def ensure_index(pc: Pinecone, index_name: str, dim: int) -> None:
-    existing_names = [idx["name"] for idx in pc.list_indexes()]
+    existing = pc.list_indexes()
+    existing_names = [idx["name"] for idx in existing]
     if index_name in existing_names:
         return
 
@@ -106,6 +120,21 @@ def ensure_index(pc: Pinecone, index_name: str, dim: int) -> None:
             region=os.getenv("PINECONE_REGION", "us-east-1"),
         ),
     )
+
+
+def clear_index(index) -> None:
+    """
+    Serverless Pinecone supports delete(delete_all=True) on many configs.
+    If your account/index does not support it, this will error and you can instead
+    change PINECONE_INDEX to a new name (recommended fallback).
+    """
+    try:
+        index.delete(delete_all=True)
+        print("✅ Cleared Pinecone index (delete_all=True).")
+    except Exception as e:
+        print("⚠️ Could not clear index automatically.")
+        print("   Fallback: set a NEW PINECONE_INDEX name (e.g., ted-rag-full) and re-run.")
+        raise
 
 
 # Optional: rough estimate only (course gateway might price differently)
@@ -126,8 +155,11 @@ def main() -> None:
     base_url = clean_base_url(os.getenv("OPENAI_BASE_URL"))
     index_name = os.getenv("PINECONE_INDEX", "ted-rag")
 
-    if not SUBSET_CSV.exists():
-        raise FileNotFoundError(f"Subset CSV not found: {SUBSET_CSV}")
+    if not FULL_CSV.exists():
+        raise FileNotFoundError(
+            f"Full CSV not found: {FULL_CSV}\n"
+            f"Run chunks.py first to generate it."
+        )
 
     # Clients
     openai_client = OpenAI(api_key=openai_key, base_url=base_url)
@@ -137,14 +169,23 @@ def main() -> None:
     import tiktoken
     tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    # Load subset
-    df = pd.read_csv(SUBSET_CSV)
+    # Load full data
+    df = pd.read_csv(FULL_CSV)
     df = df.dropna(subset=["talk_id", "title", "transcript"]).copy()
-    df["talk_id"] = df["talk_id"].astype(str)
+    df["talk_id"] = df["talk_id"].astype(str).str.strip()
+    df["title"] = df["title"].astype(str).str.strip()
 
     # Pinecone index
     ensure_index(pc, index_name, EMB_DIM)
     index = pc.Index(index_name)
+
+    # If you truly want to RE-EMBED EVERYTHING, clear existing vectors first
+    if CLEAR_INDEX_BEFORE_INGEST:
+        clear_index(index)
+        # Fresh manifest as well (avoid skipping)
+        if MANIFEST_PATH.exists():
+            MANIFEST_PATH.unlink()
+            print(f"✅ Removed old manifest: {MANIFEST_PATH}")
 
     # Manifest
     seen_hashes = load_manifest(MANIFEST_PATH)
@@ -153,12 +194,12 @@ def main() -> None:
     total_chunks_upserted = 0
     total_chunks_skipped = 0
 
-    batch_vectors = []
+    batch_vectors: List[Any] = []
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Indexing subset"):
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Indexing FULL dataset"):
         talk_id = str(row["talk_id"])
         title = str(row.get("title", ""))
-        speaker = str(row.get("speaker_1", ""))
+        speaker = str(row.get("speaker_1", "")) if "speaker_1" in row else ""
         topics = row.get("topics", "")
 
         transcript = str(row["transcript"])
@@ -179,9 +220,10 @@ def main() -> None:
                 input=chunk_text,
             ).data[0].embedding
 
+            # ✅ Deterministic ID; safe for full ingest
             vector_id = f"{talk_id}_{chunk_idx}"
 
-            # ✅ IMPORTANT: store chunk text for previews and HW output context[].chunk
+            # ✅ Store chunk text for previews and HW output context[].chunk
             metadata = {
                 "talk_id": talk_id,
                 "title": title,
@@ -189,17 +231,21 @@ def main() -> None:
                 "topics": topics,
                 "chunk_index": chunk_idx,
                 "chunk": chunk_text,
+                "source": "ted",
             }
 
             batch_vectors.append((vector_id, emb, metadata))
             total_chunks_upserted += 1
 
-            append_manifest(MANIFEST_PATH, {
-                "talk_id": talk_id,
-                "chunk_index": chunk_idx,
-                "text_hash": text_hash,
-                "tokens_est": tok_count,
-            })
+            append_manifest(
+                MANIFEST_PATH,
+                {
+                    "talk_id": talk_id,
+                    "chunk_index": chunk_idx,
+                    "text_hash": text_hash,
+                    "tokens_est": tok_count,
+                },
+            )
             seen_hashes.add(text_hash)
 
             if len(batch_vectors) >= UPSERT_BATCH:
@@ -213,12 +259,13 @@ def main() -> None:
 
     print("\nDone.")
     print(f"Index name: {index_name}")
+    print(f"Full CSV: {FULL_CSV}")
     print(f"Chunks upserted: {total_chunks_upserted}")
     print(f"Chunks skipped (manifest): {total_chunks_skipped}")
     print(f"Estimated embedded tokens: {total_tokens_est}")
     print(f"Estimated embedding cost (USD, rough): ${est_cost:.4f}")
     print(f"Manifest saved to: {MANIFEST_PATH}")
-    print("\nNext: run retrieve_chunks.py — you should now see chunk previews.")
+    print("\nNext: run a few /api/prompt queries and confirm results.")
 
 
 if __name__ == "__main__":
